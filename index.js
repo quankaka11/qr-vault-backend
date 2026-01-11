@@ -71,7 +71,7 @@ app.post('/api/auth/register', async (req, res) => {
     // Create session
     const sessionId = uuidv4();
     const session = new Session({
-      sessionId,
+      _id: sessionId,
       userId: user._id.toString()
     });
     await session.save();
@@ -114,7 +114,7 @@ app.post('/api/auth/login', async (req, res) => {
     // Create session
     const sessionId = uuidv4();
     const session = new Session({
-      sessionId,
+      _id: sessionId,
       userId: user._id.toString()
     });
     await session.save();
@@ -138,7 +138,7 @@ app.post('/api/auth/logout', async (req, res) => {
   try {
     const sessionId = req.headers.authorization?.replace('Bearer ', '');
     if (sessionId) {
-      await Session.deleteOne({ sessionId });
+      await Session.deleteOne({ _id: sessionId });
     }
     res.json({ success: true });
   } catch (error) {
@@ -155,7 +155,7 @@ app.get('/api/auth/me', async (req, res) => {
       return res.status(401).json({ success: false, error: 'Not authenticated' });
     }
 
-    const session = await Session.findOne({ sessionId });
+    const session = await Session.findById(sessionId);
 
     if (!session) {
       return res.status(401).json({ success: false, error: 'Invalid session' });
@@ -190,7 +190,7 @@ const requireAuth = async (req, res, next) => {
     return res.status(401).json({ success: false, error: 'Authentication required' });
   }
 
-  const session = await Session.findOne({ sessionId });
+  const session = await Session.findById(sessionId);
 
   if (!session) {
     return res.status(401).json({ success: false, error: 'Invalid session' });
