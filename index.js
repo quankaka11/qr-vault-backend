@@ -1,18 +1,19 @@
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import multer from 'multer';
 import bcrypt from 'bcryptjs';
 import { v4 as uuidv4 } from 'uuid';
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
-import os from 'os';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+import { connectDB } from './config/database.js';
+import { upload, cloudinary } from './config/cloudinary.js';
+import { User } from './models/User.js';
+import { QRItem } from './models/QRItem.js';
+import { Session } from './models/Session.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Connect to MongoDB
+await connectDB();
 
 // CORS configuration for production
 const corsOptions = {
@@ -25,71 +26,6 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
-// Serve uploaded images
-app.use('/uploads', express.static(join(__dirname, 'uploads')));
-
-// Data file paths
-const DATA_DIR = join(__dirname, 'data');
-const USERS_FILE = join(DATA_DIR, 'users.json');
-const QR_ITEMS_FILE = join(DATA_DIR, 'qr_items.json');
-const SESSIONS_FILE = join(DATA_DIR, 'sessions.json');
-
-// Ensure data directory exists
-if (!existsSync(DATA_DIR)) {
-  mkdirSync(DATA_DIR, { recursive: true });
-}
-
-// Helper functions to read/write JSON files
-const readJSONFile = (filePath, defaultValue = []) => {
-  try {
-    if (!existsSync(filePath)) {
-      writeFileSync(filePath, JSON.stringify(defaultValue, null, 2));
-      return defaultValue;
-    }
-    const data = readFileSync(filePath, 'utf-8');
-    return JSON.parse(data);
-  } catch (error) {
-    console.error(`Error reading ${filePath}:`, error);
-    return defaultValue;
-  }
-};
-
-const writeJSONFile = (filePath, data) => {
-  try {
-    writeFileSync(filePath, JSON.stringify(data, null, 2));
-  } catch (error) {
-    console.error(`Error writing ${filePath}:`, error);
-  }
-};
-
-// Configure multer for image uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadDir = join(__dirname, 'uploads');
-    if (!existsSync(uploadDir)) {
-      mkdirSync(uploadDir, { recursive: true });
-    }
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueName = `${uuidv4()}-${file.originalname}`;
-    cb(null, uniqueName);
-  }
-});
-
-const upload = multer({
-  storage,
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
-  fileFilter: (req, file, cb) => {
-    const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
-    if (allowedTypes.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error('Invalid file type. Only JPEG, PNG, GIF, and WebP are allowed.'));
-    }
-  }
-});
 
 // ==================== AUTH ROUTES ====================
 
@@ -111,39 +47,44 @@ app.post('/api/auth/register', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Password must be at least 6 characters' });
     }
 
-    const users = readJSONFile(USERS_FILE);
-
     // Check if user exists
-    if (users.find(u => u.email.toLowerCase() === email.toLowerCase())) {
+    const existingEmail = await User.findOne({ email: email.toLowerCase() });
+    if (existingEmail) {
       return res.status(400).json({ success: false, error: 'Email is already registered' });
     }
 
-    if (users.find(u => u.username.toLowerCase() === username.toLowerCase())) {
+    const existingUsername = await User.findOne({ username: { $regex: new RegExp(`^${username}$`, 'i') } });
+    if (existingUsername) {
       return res.status(400).json({ success: false, error: 'Username is already taken' });
     }
 
     // Create user
     const passwordHash = await bcrypt.hash(password, 10);
-    const user = {
-      id: uuidv4(),
+    const user = new User({
       username: username.trim(),
       email: email.toLowerCase().trim(),
-      passwordHash,
-      createdAt: new Date().toISOString()
-    };
+      passwordHash
+    });
 
-    users.push(user);
-    writeJSONFile(USERS_FILE, users);
+    await user.save();
 
     // Create session
     const sessionId = uuidv4();
-    const sessions = readJSONFile(SESSIONS_FILE, {});
-    sessions[sessionId] = user.id;
-    writeJSONFile(SESSIONS_FILE, sessions);
+    const session = new Session({
+      sessionId,
+      userId: user._id.toString()
+    });
+    await session.save();
 
     // Return user without password hash
-    const { passwordHash: _, ...userWithoutPassword } = user;
-    res.json({ success: true, user: userWithoutPassword, sessionId });
+    const userResponse = {
+      id: user._id.toString(),
+      username: user.username,
+      email: user.email,
+      createdAt: user.createdAt
+    };
+
+    res.json({ success: true, user: userResponse, sessionId });
   } catch (error) {
     console.error('Register error:', error);
     res.status(500).json({ success: false, error: 'Registration failed' });
@@ -159,8 +100,7 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Email and password are required' });
     }
 
-    const users = readJSONFile(USERS_FILE);
-    const user = users.find(u => u.email.toLowerCase() === email.toLowerCase());
+    const user = await User.findOne({ email: email.toLowerCase() });
 
     if (!user) {
       return res.status(401).json({ success: false, error: 'Invalid email or password' });
@@ -173,12 +113,20 @@ app.post('/api/auth/login', async (req, res) => {
 
     // Create session
     const sessionId = uuidv4();
-    const sessions = readJSONFile(SESSIONS_FILE, {});
-    sessions[sessionId] = user.id;
-    writeJSONFile(SESSIONS_FILE, sessions);
+    const session = new Session({
+      sessionId,
+      userId: user._id.toString()
+    });
+    await session.save();
 
-    const { passwordHash: _, ...userWithoutPassword } = user;
-    res.json({ success: true, user: userWithoutPassword, sessionId });
+    const userResponse = {
+      id: user._id.toString(),
+      username: user.username,
+      email: user.email,
+      createdAt: user.createdAt
+    };
+
+    res.json({ success: true, user: userResponse, sessionId });
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({ success: false, error: 'Login failed' });
@@ -186,13 +134,11 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // Logout
-app.post('/api/auth/logout', (req, res) => {
+app.post('/api/auth/logout', async (req, res) => {
   try {
     const sessionId = req.headers.authorization?.replace('Bearer ', '');
     if (sessionId) {
-      const sessions = readJSONFile(SESSIONS_FILE, {});
-      delete sessions[sessionId];
-      writeJSONFile(SESSIONS_FILE, sessions);
+      await Session.deleteOne({ sessionId });
     }
     res.json({ success: true });
   } catch (error) {
@@ -202,29 +148,33 @@ app.post('/api/auth/logout', (req, res) => {
 });
 
 // Get current user
-app.get('/api/auth/me', (req, res) => {
+app.get('/api/auth/me', async (req, res) => {
   try {
     const sessionId = req.headers.authorization?.replace('Bearer ', '');
     if (!sessionId) {
       return res.status(401).json({ success: false, error: 'Not authenticated' });
     }
 
-    const sessions = readJSONFile(SESSIONS_FILE, {});
-    const userId = sessions[sessionId];
+    const session = await Session.findOne({ sessionId });
 
-    if (!userId) {
+    if (!session) {
       return res.status(401).json({ success: false, error: 'Invalid session' });
     }
 
-    const users = readJSONFile(USERS_FILE);
-    const user = users.find(u => u.id === userId);
+    const user = await User.findById(session.userId);
 
     if (!user) {
       return res.status(401).json({ success: false, error: 'User not found' });
     }
 
-    const { passwordHash: _, ...userWithoutPassword } = user;
-    res.json({ success: true, user: userWithoutPassword });
+    const userResponse = {
+      id: user._id.toString(),
+      username: user.username,
+      email: user.email,
+      createdAt: user.createdAt
+    };
+
+    res.json({ success: true, user: userResponse });
   } catch (error) {
     console.error('Get user error:', error);
     res.status(500).json({ success: false, error: 'Failed to get user' });
@@ -234,31 +184,33 @@ app.get('/api/auth/me', (req, res) => {
 // ==================== QR ITEMS ROUTES ====================
 
 // Middleware to verify authentication
-const requireAuth = (req, res, next) => {
+const requireAuth = async (req, res, next) => {
   const sessionId = req.headers.authorization?.replace('Bearer ', '');
   if (!sessionId) {
     return res.status(401).json({ success: false, error: 'Authentication required' });
   }
 
-  const sessions = readJSONFile(SESSIONS_FILE, {});
-  const userId = sessions[sessionId];
+  const session = await Session.findOne({ sessionId });
 
-  if (!userId) {
+  if (!session) {
     return res.status(401).json({ success: false, error: 'Invalid session' });
   }
 
-  req.userId = userId;
+  req.userId = session.userId;
   next();
 };
 
 // Get all QR items (user's items + public items)
-app.get('/api/qr-items', requireAuth, (req, res) => {
+app.get('/api/qr-items', requireAuth, async (req, res) => {
   try {
-    const items = readJSONFile(QR_ITEMS_FILE);
-    const userItems = items.filter(item => 
-      item.userId === req.userId || item.isPublic
-    );
-    res.json({ success: true, items: userItems });
+    const items = await QRItem.find({
+      $or: [
+        { userId: req.userId },
+        { isPublic: true }
+      ]
+    }).sort({ createdAt: -1 });
+
+    res.json({ success: true, items });
   } catch (error) {
     console.error('Get QR items error:', error);
     res.status(500).json({ success: false, error: 'Failed to get QR items' });
@@ -266,11 +218,10 @@ app.get('/api/qr-items', requireAuth, (req, res) => {
 });
 
 // Get public QR items only
-app.get('/api/qr-items/public', (req, res) => {
+app.get('/api/qr-items/public', async (req, res) => {
   try {
-    const items = readJSONFile(QR_ITEMS_FILE);
-    const publicItems = items.filter(item => item.isPublic);
-    res.json({ success: true, items: publicItems });
+    const items = await QRItem.find({ isPublic: true }).sort({ createdAt: -1 });
+    res.json({ success: true, items });
   } catch (error) {
     console.error('Get public QR items error:', error);
     res.status(500).json({ success: false, error: 'Failed to get public QR items' });
@@ -278,23 +229,22 @@ app.get('/api/qr-items/public', (req, res) => {
 });
 
 // Get public user info (username only) by userId - no auth required
-app.get('/api/users/:userId/public', (req, res) => {
+app.get('/api/users/:userId/public', async (req, res) => {
   try {
     const { userId } = req.params;
-    const users = readJSONFile(USERS_FILE);
-    const user = users.find(u => u.id === userId);
+    const user = await User.findById(userId);
 
     if (!user) {
       return res.status(404).json({ success: false, error: 'User not found' });
     }
 
     // Only return public info (username, id)
-    res.json({ 
-      success: true, 
-      user: { 
-        id: user.id, 
-        username: user.username 
-      } 
+    res.json({
+      success: true,
+      user: {
+        id: user._id.toString(),
+        username: user.username
+      }
     });
   } catch (error) {
     console.error('Get public user info error:', error);
@@ -302,8 +252,8 @@ app.get('/api/users/:userId/public', (req, res) => {
   }
 });
 
-// Create QR item with image upload
-app.post('/api/qr-items', requireAuth, upload.single('image'), (req, res) => {
+// Create QR item with image upload to Cloudinary
+app.post('/api/qr-items', requireAuth, upload.single('image'), async (req, res) => {
   try {
     const { title, description, isPublic } = req.body;
 
@@ -311,31 +261,24 @@ app.post('/api/qr-items', requireAuth, upload.single('image'), (req, res) => {
       return res.status(400).json({ success: false, error: 'Title is required' });
     }
 
-    let imageUrl = null;
-    let imageId = null;
+    let imageUrl = '';
+    let imageId = '';
 
     if (req.file) {
-      imageId = req.file.filename;
-      // Get server's local IP for LAN access
-      const host = req.get('host').split(':')[0];
-      imageUrl = `http://${host}:${PORT}/uploads/${req.file.filename}`;
+      imageUrl = req.file.path; // Cloudinary URL
+      imageId = req.file.filename; // Cloudinary public_id
     }
 
-    const qrItem = {
-      id: uuidv4(),
+    const qrItem = new QRItem({
       userId: req.userId,
       title,
       description: description || '',
-      imageId: imageId || '',
-      imageUrl: imageUrl || '',
-      isPublic: isPublic === 'true' || isPublic === true,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
+      imageId,
+      imageUrl,
+      isPublic: isPublic === 'true' || isPublic === true
+    });
 
-    const items = readJSONFile(QR_ITEMS_FILE);
-    items.push(qrItem);
-    writeJSONFile(QR_ITEMS_FILE, items);
+    await qrItem.save();
 
     res.json({ success: true, item: qrItem });
   } catch (error) {
@@ -345,19 +288,16 @@ app.post('/api/qr-items', requireAuth, upload.single('image'), (req, res) => {
 });
 
 // Update QR item
-app.put('/api/qr-items/:id', requireAuth, upload.single('image'), (req, res) => {
+app.put('/api/qr-items/:id', requireAuth, upload.single('image'), async (req, res) => {
   try {
     const { id } = req.params;
     const { title, description, isPublic } = req.body;
 
-    const items = readJSONFile(QR_ITEMS_FILE);
-    const itemIndex = items.findIndex(item => item.id === id && item.userId === req.userId);
+    const item = await QRItem.findOne({ _id: id, userId: req.userId });
 
-    if (itemIndex === -1) {
+    if (!item) {
       return res.status(404).json({ success: false, error: 'QR item not found' });
     }
-
-    const item = items[itemIndex];
 
     // Update fields
     if (title !== undefined) item.title = title;
@@ -366,14 +306,21 @@ app.put('/api/qr-items/:id', requireAuth, upload.single('image'), (req, res) => 
 
     // Update image if new one is uploaded
     if (req.file) {
-      const host = req.get('host').split(':')[0];
+      // Delete old image from Cloudinary if exists
+      if (item.imageId) {
+        try {
+          await cloudinary.uploader.destroy(item.imageId);
+        } catch (err) {
+          console.error('Error deleting old image:', err);
+        }
+      }
+
       item.imageId = req.file.filename;
-      item.imageUrl = `http://${host}:${PORT}/uploads/${req.file.filename}`;
+      item.imageUrl = req.file.path;
     }
 
-    item.updatedAt = new Date().toISOString();
-    items[itemIndex] = item;
-    writeJSONFile(QR_ITEMS_FILE, items);
+    item.updatedAt = new Date();
+    await item.save();
 
     res.json({ success: true, item });
   } catch (error) {
@@ -383,18 +330,25 @@ app.put('/api/qr-items/:id', requireAuth, upload.single('image'), (req, res) => 
 });
 
 // Delete QR item
-app.delete('/api/qr-items/:id', requireAuth, (req, res) => {
+app.delete('/api/qr-items/:id', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    const items = readJSONFile(QR_ITEMS_FILE);
-    const itemIndex = items.findIndex(item => item.id === id && item.userId === req.userId);
+    const item = await QRItem.findOne({ _id: id, userId: req.userId });
 
-    if (itemIndex === -1) {
+    if (!item) {
       return res.status(404).json({ success: false, error: 'QR item not found' });
     }
 
-    items.splice(itemIndex, 1);
-    writeJSONFile(QR_ITEMS_FILE, items);
+    // Delete image from Cloudinary if exists
+    if (item.imageId) {
+      try {
+        await cloudinary.uploader.destroy(item.imageId);
+      } catch (err) {
+        console.error('Error deleting image:', err);
+      }
+    }
+
+    await QRItem.deleteOne({ _id: id });
 
     res.json({ success: true });
   } catch (error) {
@@ -405,20 +359,17 @@ app.delete('/api/qr-items/:id', requireAuth, (req, res) => {
 
 // ==================== IMAGE ROUTES ====================
 
-// Upload image (standalone)
-app.post('/api/upload', requireAuth, upload.single('image'), (req, res) => {
+// Upload image (standalone) to Cloudinary
+app.post('/api/upload', requireAuth, upload.single('image'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ success: false, error: 'No image file provided' });
     }
 
-    const host = req.get('host').split(':')[0];
-    const imageUrl = `http://${host}:${PORT}/uploads/${req.file.filename}`;
-
     res.json({
       success: true,
       imageId: req.file.filename,
-      imageUrl
+      imageUrl: req.file.path
     });
   } catch (error) {
     console.error('Upload error:', error);
@@ -429,32 +380,21 @@ app.post('/api/upload', requireAuth, upload.single('image'), (req, res) => {
 // ==================== HEALTH CHECK ====================
 
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    database: 'MongoDB',
+    storage: 'Cloudinary'
+  });
 });
 
-// Get network interfaces
-function getLocalIPAddress() {
-  const interfaces = os.networkInterfaces();
-  for (const name of Object.keys(interfaces)) {
-    for (const iface of interfaces[name]) {
-      // Skip internal and non-IPv4 addresses
-      if (iface.family === 'IPv4' && !iface.internal) {
-        return iface.address;
-      }
-    }
-  }
-  return 'localhost';
-}
-
-// Start server - bind to 0.0.0.0 for LAN access
+// Start server
 app.listen(PORT, '0.0.0.0', () => {
-  const localIP = getLocalIPAddress();
   console.log('='.repeat(50));
   console.log('🚀 QR Vault Server is running!');
   console.log('='.repeat(50));
-  console.log(`📍 Local:   http://localhost:${PORT}`);
-  console.log(`📍 Network: http://${localIP}:${PORT}`);
-  console.log('='.repeat(50));
-  console.log('Share the Network URL with devices on your LAN');
+  console.log(`📍 Port: ${PORT}`);
+  console.log(`💾 Database: MongoDB`);
+  console.log(`☁️  Storage: Cloudinary`);
   console.log('='.repeat(50));
 });
